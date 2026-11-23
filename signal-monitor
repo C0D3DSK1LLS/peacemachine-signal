@@ -1,0 +1,1219 @@
+#!/usr/bin/env python3
+"""PeaceMachine Signal, a read-only Linux terminal system monitor."""
+import argparse
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+import csv
+import curses
+from heapq import nlargest
+import math
+import os
+from pathlib import Path
+import pwd
+from random import Random
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from typing import NamedTuple
+from unicodedata import combining, east_asian_width
+
+try:
+    import psutil
+except ImportError:
+    raise SystemExit("PeaceMachine Signal needs psutil 6.0 or newer. See requirements.txt.")
+
+
+def size(value):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if value < 1024 or unit == "PiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def rate(value):
+    return f"{size(value)}/s"
+
+
+def age(seconds):
+    days, remainder = divmod(max(0, int(seconds)), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    return f"{days}d {hours:02}:{minutes:02}" if days else f"{hours:02}:{minutes:02}"
+
+
+def palette_rgb(index):
+    if index >= 232:
+        shade = 8 + 10 * (index - 232)
+        return shade * 0x010101
+    level = (0, 95, 135, 175, 215, 255)
+    red, remainder = divmod(index - 16, 36)
+    green, blue = divmod(remainder, 6)
+    return (level[red] << 16) | (level[green] << 8) | level[blue]
+
+
+def delta(now, before, field, elapsed):
+    if before is None:
+        return 0.0
+    return max(0, getattr(now, field) - getattr(before, field)) / elapsed
+
+
+def cpu_name():
+    try:
+        with open("/proc/cpuinfo") as source:
+            for line in source:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "CPU"
+
+
+def cpu_ids():
+    ids = []
+    try:
+        with open("/proc/stat") as source:
+            for line in source:
+                tag = line.split(None, 1)[0]
+                if not tag.startswith("cpu"):
+                    break
+                if tag[3:].isdigit():
+                    ids.append(int(tag[3:]))
+    except OSError:
+        pass
+    return ids
+
+
+def core_topology(ids):
+    result = {}
+    for cpu in ids:
+        path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = int((path / "physical_package_id").read_text())
+            core = int((path / "core_id").read_text())
+        except (OSError, ValueError):
+            continue
+        result[cpu] = (package, core)
+    return result
+
+
+def read_core_temperatures(topology, hwmon=Path("/sys/class/hwmon")):
+    by_core = {}
+    for device in hwmon.glob("hwmon*"):
+        try:
+            if (device / "name").read_text().strip() != "coretemp":
+                continue
+        except OSError:
+            continue
+        package = None
+        readings = {}
+        for path in device.glob("temp*_label"):
+            try:
+                label = path.read_text().strip()
+                kind, _, number = label.rpartition(" ")
+                if kind == "Package id":
+                    package = int(number)
+                elif kind == "Core":
+                    sensor = path.with_name(path.name.removesuffix("_label") + "_input")
+                    readings[int(number)] = int(sensor.read_text()) / 1000
+            except (OSError, ValueError):
+                continue
+        if package is not None:
+            by_core.update({(package, core): value for core, value in readings.items()})
+    return {cpu: by_core[key] for cpu, key in topology.items() if key in by_core}
+
+
+def read_gpu(executable):
+    if executable is None:
+        return [], "nvidia-smi unavailable"
+    fields = "name,utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw,fan.speed"
+    try:
+        result = subprocess.run(
+            [executable, "--query-gpu=" + fields, "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=1.5, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return [], "NVIDIA telemetry unavailable"
+    rows = [row for row in csv.reader(result.stdout.splitlines(), skipinitialspace=True) if len(row) == 7]
+    return rows, None if rows else "No NVIDIA GPU reported"
+
+
+def usable_number(value):
+    try:
+        number = float(value)
+    except ValueError:
+        return 0.0
+    return number if math.isfinite(number) else 0.0
+
+
+def metric(value, unit):
+    return "—" if value in ("N/A", "[N/A]", "[Not Supported]") else value + unit
+
+
+def read_disks():
+    try:
+        return psutil.disk_io_counters(perdisk=True, nowrap=False) or {}
+    except OSError:
+        return {}
+
+
+def read_network():
+    try:
+        return psutil.net_io_counters(pernic=True, nowrap=False) or {}
+    except OSError:
+        return {}
+
+
+def read_mounts():
+    mounts = []
+    seen = set()
+    for part in sorted(psutil.disk_partitions(), key=lambda p: (p.mountpoint.count("/"), p.mountpoint)):
+        if not part.device.startswith("/dev/") or part.device.startswith("/dev/sr"):
+            continue
+        if part.device in seen:
+            continue
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+        except OSError:
+            continue
+        seen.add(part.device)
+        mounts.append((part.mountpoint, usage))
+    return mounts
+
+
+class Process(NamedTuple):
+    pid: int
+    name: str
+    cpu: float
+    rss: int
+    state: str
+    parent: int
+    threads: int | None
+    user: str
+
+
+class BinaryStream(NamedTuple):
+    lane: int
+    offset: int
+    speed: float
+    reverse: bool
+    digits: str
+    glint: int
+
+
+class Monitor:
+    def __init__(self, executor, interval):
+        self.executor = executor
+        self.gpu_command = shutil.which("nvidia-smi")
+        self.interval = interval
+        self.host = socket.gethostname()
+        self.model = cpu_name()
+        self.physical = psutil.cpu_count(logical=False)
+        self.allowed = len(os.sched_getaffinity(0))
+        self.boot = psutil.boot_time()
+        self.cpu = 0.0
+        self.cores = []
+        self.cpu_ids = []
+        self.topology = None
+        self.core_temps = {}
+        self.freq = self.temp = None
+        self.mem = self.swap = None
+        self.mounts = []
+        self.drives = []
+        self.links = []
+        self.procs = []
+        self.users = {}
+        self.gpus = []
+        self.gpu_message = "Sampling NVIDIA telemetry"
+        self.graphs = {name: deque(maxlen=360) for name in ("cpu", "gpu", "read", "write", "rx", "tx")}
+        self.core_history = defaultdict(lambda: deque(maxlen=40))
+        self.last_disk = read_disks()
+        self.last_net = read_network()
+        self.last_proc = {}
+        self.proc_history = {}
+        self.last_sample = time.monotonic()
+        self.next_detail = self.next_gpu = 0
+        self.pending_gpu = None
+        psutil.cpu_percent()
+        psutil.cpu_percent(percpu=True)
+
+    def poll_gpu(self, now):
+        if self.pending_gpu is not None and self.pending_gpu.done():
+            self.gpus, self.gpu_message = self.pending_gpu.result()
+            self.pending_gpu = None
+            self.graphs["gpu"].append(usable_number(self.gpus[0][1]) if self.gpus else 0)
+        if self.pending_gpu is None and now >= self.next_gpu:
+            self.pending_gpu = self.executor.submit(read_gpu, self.gpu_command)
+            self.next_gpu = now + max(2.0, self.interval)
+
+    def sample(self):
+        now = time.monotonic()
+        elapsed = max(0.001, now - self.last_sample)
+        self.last_sample = now
+        self.cpu = psutil.cpu_percent()
+        self.cores = psutil.cpu_percent(percpu=True)
+        ids = cpu_ids()
+        known_ids = len(ids) == len(self.cores)
+        if not known_ids:
+            self.core_temps = {}
+            self.topology = None
+            ids = list(range(len(self.cores)))
+        if ids != self.cpu_ids or (known_ids and self.topology is None):
+            self.cpu_ids = ids
+            self.topology = core_topology(ids) if known_ids else None
+            self.next_detail = 0
+        for cpu, load in zip(self.cpu_ids, self.cores):
+            self.core_history[cpu].append(load)
+        self.mem = psutil.virtual_memory()
+        self.swap = psutil.swap_memory()
+        if now >= self.next_detail:
+            self.next_detail = now + 3
+            try:
+                freq = psutil.cpu_freq()
+                self.freq = freq.current if freq else None
+            except OSError:
+                self.freq = None
+            try:
+                temps = psutil.sensors_temperatures()
+            except OSError:
+                temps = {}
+            candidates = [entry for chip in ("coretemp", "k10temp", "zenpower", "cpu_thermal")
+                          for entry in temps.get(chip, ())]
+            self.temp = next((entry.current for entry in candidates
+                              if entry.label.startswith("Package") or entry.label == "Tdie"), None)
+            if self.temp is None:
+                self.temp = max((entry.current for entry in candidates), default=None)
+            self.core_temps = read_core_temperatures(self.topology) if known_ids else {}
+            self.mounts = read_mounts()
+
+        self.graphs["cpu"].append(self.cpu)
+        disk = read_disks()
+        self.drives = [(name, delta(row, self.last_disk.get(name), "read_bytes", elapsed),
+                        delta(row, self.last_disk.get(name), "write_bytes", elapsed))
+                       for name, row in sorted(disk.items())
+                       if not name.startswith(("loop", "ram", "zram"))
+                       and (Path("/sys/block") / name).exists()
+                       and not name.startswith(("dm-", "md"))]
+        self.last_disk = disk
+        network = read_network()
+        self.links = [(name, delta(row, self.last_net.get(name), "bytes_recv", elapsed),
+                       delta(row, self.last_net.get(name), "bytes_sent", elapsed))
+                      for name, row in sorted(network.items()) if name != "lo"]
+        self.last_net = network
+        for rows, names in ((self.drives, ("read", "write")), (self.links, ("rx", "tx"))):
+            for field, name in enumerate(names, 1):
+                self.graphs[name].append(sum(row[field] for row in rows))
+        self.sample_processes(elapsed)
+        self.poll_gpu(now)
+        self.load = os.getloadavg()
+
+    def sample_processes(self, elapsed):
+        snapshot = {}
+        histories = {}
+        rows = []
+        # Rebuild identities so a reused PID cannot inherit its predecessor's CPU sample.
+        psutil.process_iter.cache_clear()
+        fields = ("name", "create_time", "cpu_times", "memory_info", "status", "ppid", "num_threads", "uids")
+        for proc in psutil.process_iter(fields):
+            info = proc.info
+            ticks = info["cpu_times"]
+            identity = (proc.pid, info["create_time"])
+            percent = 0.0
+            if ticks is not None:
+                total = ticks.user + ticks.system
+                previous = self.last_proc.get(identity, total)
+                percent = max(0.0, (total - previous) / elapsed * 100)
+                snapshot[identity] = total
+            history = self.proc_history.get(identity)
+            if history is None:
+                history = deque(maxlen=28)
+            history.append(percent)
+            histories[identity] = history
+            memory = info["memory_info"]
+            uids = info["uids"]
+            user = "?"
+            if uids is not None:
+                uid = uids.real
+                if uid not in self.users:
+                    try:
+                        self.users[uid] = pwd.getpwuid(uid).pw_name
+                    except KeyError:
+                        self.users[uid] = str(uid)
+                user = self.users[uid]
+            rows.append(Process(proc.pid, info["name"] or "?", percent,
+                                memory.rss if memory else 0, info["status"] or "?",
+                                info["ppid"] or 0, info["num_threads"], user))
+        self.procs = rows
+        self.last_proc = snapshot
+        self.proc_history = histories
+        self.proc_traces = {pid: history for (pid, _), history in histories.items()}
+
+
+class Screen:
+    KEYS = ("Overview", "CPU", "GPU", "Disks", "Network", "Processes")
+    SORT_FIELDS = (2, 3, 1, 0)
+    SORT_LABELS = ("CPU", "RAM", "NAME", "PID")
+    BLOCKS = " ▁▂▃▄▅▆▇█"
+    DOTS = ((0, 64, 68, 70, 71), (0, 128, 160, 176, 184))
+    TOP_DOTS = ((0, 1, 3, 7, 71), (0, 8, 24, 56, 184))
+    RED, BLUE, DARK_BLUE, DARK_RED, VIOLET, BINARY_RED, BINARY_WHITE = range(10, 17)
+    PROCESS_GREY, PROCESS_DIM = range(17, 19)
+    ORANGE, NEON_GREEN, AMBER_HALO, AQUA_HALO = range(19, 23)
+    HISTORY_RED = 23
+    BINARY_SHADOW, BINARY_MID = range(24, 26)
+    GLYPH_BANK = "⌁⌬◈⋮⟡⊹∴⟐⊕⌖△⋄⋰⊗⊞⊙⋔▽○■◌◇⊿⋇⌇⌗∺∵"
+    GLYPH_FPS = 12
+
+    def __init__(self, window, monitor):
+        self.win = window
+        self.monitor = monitor
+        self.page = 0
+        self.sort = 0
+        self.reverse = True
+        self.tree = True
+        self.offset = 0
+        self.detail_scroll = 0
+        self.filter = ""
+        self.editing = False
+        self.help = False
+        self.binary = True
+        self.binary_regions = []
+        self.binary_streams = {}
+        self.binary_random = Random()
+        self.binary_epoch = time.monotonic()
+        self.header_glyphs = self.binary_random.choices(self.GLYPH_BANK, k=128)
+        self.glyph_region = None
+        self.glyph_frame = -1
+        self.scroll_limit = 0
+        self.visible_processes = 1
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.colors = [curses.A_BOLD, curses.A_BOLD, curses.A_DIM, curses.A_NORMAL,
+                       curses.A_BOLD, curses.A_BOLD, curses.A_NORMAL, curses.A_NORMAL,
+                       curses.A_BOLD, curses.A_DIM, curses.A_BOLD, curses.A_BOLD,
+                       curses.A_NORMAL, curses.A_NORMAL, curses.A_BOLD, curses.A_DIM, curses.A_DIM,
+                       curses.A_NORMAL, curses.A_NORMAL, curses.A_BOLD, curses.A_BOLD,
+                       curses.A_DIM, curses.A_DIM, curses.A_BOLD, curses.A_DIM, curses.A_DIM]
+        if curses.has_colors():
+            curses.start_color()
+            background = curses.COLOR_BLACK
+            try:
+                curses.use_default_colors()
+                background = -1
+            except curses.error:
+                pass
+            indexed = (118, 51, 29, 194, 57, 220, 40, 35, 226, 22,
+                       196, 39, 25, 124, 57, 52, 250, 252, 245, 208, 82, 94, 23, 124,
+                       233, 52)
+            if curses.COLORS >= 1 << 24:
+                colors = [palette_rgb(index) for index in indexed]
+                colors[4] = colors[self.VIOLET] = 0x5600FC
+                colors[self.PROCESS_GREY] = 0xD3D3D3
+                colors[self.HISTORY_RED] = 0xB52030
+                colors[self.BINARY_SHADOW] = 0x380000
+                colors[self.BINARY_MID] = 0x4D0000
+            elif curses.COLORS >= 256:
+                colors = indexed
+            else:
+                colors = (
+                    curses.COLOR_GREEN, curses.COLOR_CYAN, curses.COLOR_GREEN,
+                    curses.COLOR_WHITE, curses.COLOR_MAGENTA, curses.COLOR_YELLOW, curses.COLOR_GREEN,
+                    curses.COLOR_CYAN, curses.COLOR_YELLOW, curses.COLOR_GREEN,
+                    curses.COLOR_RED, curses.COLOR_BLUE, curses.COLOR_BLUE, curses.COLOR_RED,
+                    curses.COLOR_MAGENTA, curses.COLOR_RED, curses.COLOR_WHITE,
+                    curses.COLOR_WHITE, curses.COLOR_WHITE, curses.COLOR_YELLOW, curses.COLOR_GREEN,
+                    curses.COLOR_YELLOW, curses.COLOR_CYAN, curses.COLOR_RED,
+                    curses.COLOR_RED, curses.COLOR_RED,
+                )
+            for pair, color in enumerate(colors, 1):
+                if pair < curses.COLOR_PAIRS:
+                    curses.init_pair(pair, color, background)
+                    self.colors[pair - 1] |= curses.color_pair(pair)
+
+    def put(self, y, x, value, color=3, width=None):
+        h, w = self.win.getmaxyx()
+        available = w - x - 1
+        if y < 0 or y >= h or x < 0 or available <= 0:
+            return
+        if width is not None:
+            available = min(available, width)
+        if available <= 0:
+            return
+        value = "".join(ch if ch.isprintable() else "?" for ch in str(value))
+        if value.isascii():
+            value = value[:available]
+        else:
+            cells = 0
+            for index, ch in enumerate(value):
+                if not combining(ch):
+                    cells += 2 if east_asian_width(ch) in ("W", "F") else 1
+                if cells > available:
+                    value = value[:index]
+                    break
+        try:
+            self.win.addstr(y, x, value, self.colors[color])
+        except curses.error:
+            pass
+
+    def box(self, y, x, height, width, title, color=0, trim=None, rail_color=2):
+        self.put(y, x, "┌──╼ ", color if trim else 6, width - 1)
+        self.put(y, x + 5, title, color, width - 6)
+        start = min(len(title) + 6, width - 1)
+        rail = width - start - 1
+        pattern = trim or "-·-"
+        self.put(y, x + start, (pattern * width)[:rail] + "┐", rail_color, width - start)
+        if trim and rail >= 8:
+            self.put(y, x + width - 6, "||||", color, 4)
+        for row in range(y + 1, y + height - 1):
+            edge = "┆" if (row - y) % 4 == 0 else "│"
+            self.put(row, x, edge, rail_color)
+            self.put(row, x + width - 1, edge, color if trim and edge == "┆" else rail_color)
+        self.put(y + height - 1, x, "└──" + "." * (width - 6) + "──┘", rail_color, width)
+        if trim:
+            self.put(y + height - 1, x + 3, "----", color, 4)
+            self.put(y + height - 1, x + width - 7, "----", color, 4)
+
+    def bar(self, y, x, width, percent, color=0):
+        filled = round(width * min(100, max(0, percent)) / 100)
+        self.put(y, x, "·" * width, self.DARK_BLUE if color in (1, self.BLUE, self.VIOLET) else 9, width)
+        if filled:
+            edge = max(1, filled // 5)
+            shadow = {0: 6, 1: self.DARK_BLUE, self.BLUE: self.DARK_BLUE, self.RED: self.DARK_RED}
+            self.put(y, x, "▓" * (filled - edge), shadow.get(color, color), width)
+            self.put(y, x + filled - edge, "█" * edge, color, edge)
+            if filled < width:
+                self.put(y, x + filled, "░", 2)
+
+    def graph(self, y, x, height, width, key, upper, color):
+        values = self.monitor.graphs[key]
+        bars = list(values)[-width:]
+        for line in range(height):
+            threshold = (height - line - 1) * 8
+            plot = "".join(self.BLOCKS[min(8, max(0, math.ceil(v / upper * height * 8) - threshold))]
+                           for v in bars)
+            self.put(y + line, x, plot.rjust(width), color, width)
+
+    def trace(self, y, x, height, width, key, upper, colors, mirrored=False, grid=(), grid_color=2):
+        samples = list(self.monitor.graphs[key])[-2 * width:]
+        levels = [0] * (2 * width - len(samples))
+        levels.extend(min(height * 4, math.ceil(value * height * 4 / upper)) for value in samples)
+        dots = self.TOP_DOTS if mirrored else self.DOTS
+        for row in range(height):
+            depth = row if mirrored else height - 1 - row
+            threshold = depth * 4
+            glyphs = []
+            for left, right in zip(levels[::2], levels[1::2]):
+                first = dots[0][min(4, max(0, left - threshold))]
+                second = dots[1][min(4, max(0, right - threshold))]
+                glyphs.append(chr(0x2800 + (first | second)) if first or second else " ")
+            color = colors[min(len(colors) - 1, depth * len(colors) // height)]
+            self.put(y + row, x, "".join(glyphs), color, width)
+            if row in grid:
+                for col in range(0, width, 3):
+                    if glyphs[col] == " ":
+                        self.put(y + row, x + col, ".", grid_color)
+
+    def wide_overview(self, height, width):
+        top = 3
+        bottom_height = min(15, max(10, height // 3))
+        upper_height = height - top - bottom_height - 2
+        left = width * 54 // 100
+        right_x = left + 1
+        self.binary_regions.append((top, left, upper_height, 1))
+        self.binary_regions.append((top + upper_height, 1, 1, width - 2))
+        right = width - right_x
+        memory_width = right // 2
+        stats_height = min(11, max(7, upper_height // 2))
+        self.process_panel(top, left, upper_height)
+        self.wide_memory(top, right_x, memory_width, stats_height)
+        self.wide_storage(top, right_x + memory_width, right - memory_width, stats_height)
+        self.wide_network(top + stats_height, right_x, right, upper_height - stats_height)
+        self.wide_compute(top + upper_height + 1, width, bottom_height)
+
+    def wide_memory(self, y, x, width, height):
+        m = self.monitor
+        self.box(y, x, height, width, f"MEMORY / {size(m.mem.total)}", self.VIOLET, "....")
+        used = m.mem.total - m.mem.available
+        data = (("Used", used, m.mem.total, self.RED if m.mem.percent >= 85 else 0),
+                ("Available", m.mem.available, m.mem.total, 1),
+                ("Cache", getattr(m.mem, "cached", 0), m.mem.total, self.BLUE),
+                ("Swap", m.swap.used, m.swap.total, self.VIOLET))
+        large = height >= 10
+        for i, (label, amount, total, color) in enumerate(data):
+            row = y + 1 + i * (2 if large else 1)
+            value = f"{label:.<10}{size(amount) if total else 'off'}"
+            if i == 3 and total:
+                full = f"{value} / {size(total)}"
+                if len(full) <= width - 4:
+                    value = full
+            remaining = width - 5 - len(value)
+            self.put(row, x + 2, value, color, width - 4)
+            if total:
+                if large:
+                    self.bar(row + 1, x + 2, width - 4, amount / total * 100, color)
+                elif remaining >= 4:
+                    self.bar(row, x + 3 + len(value), remaining, amount / total * 100, color)
+
+    def wide_storage(self, y, x, width, height):
+        m = self.monitor
+        self.box(y, x, height, width, "STORAGE", 5, "----.")
+        for i, (mount, usage) in enumerate(m.mounts[:height - 4]):
+            name = "root" if mount == "/" else Path(mount).name
+            suffix = f" {usage.percent:3.0f}% {size(usage.total)}"
+            meter = min(10, max(0, width - 31))
+            room = max(2, width - 4 - len(suffix) - meter)
+            self.put(y + i + 1, x + 2, f"{name:.<{room}.{room}}", 3, room)
+            if meter > 0:
+                self.bar(y + i + 1, x + 2 + room, meter, usage.percent, self.RED if usage.percent >= 90 else 0)
+            self.put(y + i + 1, x + 2 + room + meter, suffix, self.RED if usage.percent >= 90 else 3, len(suffix))
+        for index, (label, key) in enumerate((("Read", "read"), ("Write", "write"))):
+            value = rate(m.graphs[key][-1]) if m.drives else "—"
+            self.put(y + height - 3 + index, x + 2, f"{label:.<9}{value}", 1 if index == 0 else 5, width - 4)
+
+    def wide_network(self, y, x, width, height):
+        m = self.monitor
+        self.box(y, x, height, width, "NETWORK // AGGREGATE", self.BLUE, "~~~~")
+        if not m.links:
+            self.put(y + 1, x + 2, "No non-loopback interfaces visible", 2, width - 4)
+            if height >= 5:
+                self.put(y + 2, x + 2, ("~~~~...." * width)[:width - 4], self.DARK_BLUE, width - 4)
+            return
+        tx, rx = m.graphs["tx"], m.graphs["rx"]
+        self.put(y + 1, x + 2, f"TX ↑ {rate(tx[-1])}", 0, width // 2 - 2)
+        self.put(y + 1, x + width // 2, f"RX ↓ {rate(rx[-1])}", 1, width // 2 - 2)
+        if height < 6:
+            return
+        top = (height - 4) // 2
+        bottom = height - 4 - top
+        self.trace(y + 2, x + 2, top, width - 4, "tx", max(1, max(tx)), (0, 5, self.RED), grid=(0,))
+        separator = y + 2 + top
+        self.put(separator, x + 2, ("~~~~----" * width)[:width - 4], self.DARK_BLUE, width - 4)
+        self.put(separator, x + width - 8, " 0 B/s", 1, 6)
+        self.trace(y + 3 + top, x + 2, bottom - 1, width - 4, "rx", max(1, max(rx)),
+                   (self.BLUE, 1, self.VIOLET), True, grid=(bottom - 2,))
+
+    def wide_compute(self, y, width, height):
+        m = self.monitor
+        graph_width = width * 38 // 100
+        self.box(y, 0, height, graph_width, "CPU HISTORY // %", 0)
+        stats = f"{m.cpu:.1f}%"
+        if m.freq:
+            stats += f"   {m.freq / 1000:.2f} GHz"
+        if m.temp is not None:
+            stats += f"   {m.temp:.0f}°C"
+        self.put(y + 1, 2, stats, 0, graph_width - 4)
+        plot_height = height - 4
+        marks = {round((100 - level) / 100 * (plot_height - 1)): level for level in (100, 75, 50, 25, 0)}
+        self.trace(y + 2, 7, plot_height, graph_width - 9, "cpu", 100, (0, 6, 1, 8),
+                   grid=marks, grid_color=self.PROCESS_GREY)
+        for row, level in marks.items():
+            self.put(y + 2 + row, 2, f"{level:>3}┤", self.HISTORY_RED)
+            self.put(y + 2 + row, 6, "▏", self.BINARY_RED)
+        self.put(y + height - 2, 1, "░", self.BINARY_RED)
+        load = "LOAD  " + "   ".join(f"{n:.2f}" for n in m.load)
+        self.put(y + height - 2, 2, load, self.HISTORY_RED, graph_width - 4)
+        if len(load) + 4 < graph_width:
+            self.put(y + height - 2, len(load) + 2, "░", self.BINARY_RED)
+        x = graph_width + 1
+        panel_width = width - x
+        self.box(y, x, height, panel_width, f"COMPUTE // {len(m.cores)} LOGICAL CPUs", 0, "----")
+        thermal = bool(m.core_temps)
+        columns = min(8, (panel_width - 4) // (16 if thermal else 13))
+        cell = (panel_width - 4) // columns
+        grid_rows = height - 4
+        for index, load in enumerate(m.cores[:columns * grid_rows]):
+            line = y + 1 + index // columns
+            col = x + 2 + index % columns * cell
+            cpu = m.cpu_ids[index]
+            plot_width = cell - (15 if thermal else 11)
+            levels = list(m.core_history[cpu])[-plot_width:]
+            plot = "".join(self.BLOCKS[min(8, math.ceil(value * 8 / 100))] for value in levels)
+            color = self.RED if load >= 80 else 5 if load >= 60 else 0
+            self.put(line, col, f"{cpu:02}", self.BLUE, 2)
+            self.put(line, col + 3, f"{load:3.0f}%", color, 4)
+            self.put(line, col + 8, plot.rjust(plot_width, "·"), color, plot_width)
+            if thermal:
+                self.core_temperature(line, col + cell - 6, cpu)
+            if index % columns < columns - 1:
+                self.put(line, col + cell - 1, "|", self.DARK_BLUE)
+        used_rows = math.ceil(len(m.cores) / columns)
+        if used_rows < grid_rows:
+            self.put(y + 1 + used_rows, x + 2, m.model, self.BLUE, panel_width - 4)
+            spare = grid_rows - used_rows - 1
+            if spare > 0:
+                self.binary_regions.append((y + 2 + used_rows, x + 2, spare, panel_width - 4))
+        self.put(y + height - 3, x + 2, ("----||||" * panel_width)[:panel_width - 4], self.VIOLET)
+        if m.gpus:
+            _, load, temp, used, total, power, _ = m.gpus[0]
+            brief = f"GPU  {metric(load, '%')}   {metric(temp, '°C')}   {metric(power, ' W')}"
+            if usable_number(total) > 0 and metric(used, "") != "—":
+                brief += f"   VRAM {size(usable_number(used) * 1048576)} / {size(usable_number(total) * 1048576)}"
+            color = self.RED if usable_number(temp) >= 85 else self.VIOLET
+            self.put(y + height - 2, x + 2, brief, color, panel_width - 4)
+            meter_width = panel_width - 6 - len(brief)
+            if meter_width >= 5:
+                self.bar(y + height - 2, x + 4 + len(brief), meter_width, usable_number(load), color)
+        else:
+            self.put(y + height - 2, x + 2, m.gpu_message, 4, panel_width - 4)
+
+    def core_temperature(self, row, x, cpu):
+        temp = self.monitor.core_temps.get(cpu)
+        if temp is None:
+            self.put(row, x, "    —", 2, 5)
+            return
+        color = self.RED if temp >= 85 else 5 if temp >= 70 else 1
+        self.put(row, x, f"{temp:3.0f}°C", color, 5)
+
+    def cpu_panel(self, y, width, height):
+        m = self.monitor
+        stats = f"{m.cpu:5.1f}%  LOAD  " + "  ".join(f"{n:.2f}" for n in m.load)
+        if m.freq:
+            stats += f"     {m.freq / 1000:.2f} GHz"
+        if m.temp is not None:
+            stats += f"     {m.temp:.0f}°C"
+        self.box(y, 0, height, width, "CPU")
+        self.put(y + 1, 2, stats, 0, width - 4)
+        thermal = bool(m.core_temps)
+        columns = min(len(m.cores) or 1, max(1, (width - 4) // (17 if thermal else 14)), 8)
+        per_row = (width - 4) // columns
+        total_rows = math.ceil(len(m.cores) / columns)
+        graph_height = max(1, min(8, height - 4 - total_rows))
+        rows = height - 4 - graph_height
+        self.graph(y + 2, 2, graph_height, width - 4, "cpu", 100, 0)
+        self.put(y + 2 + graph_height, 2, "─" * (width - 4), 2)
+        first = 0
+        if self.page == 1:
+            self.scroll_limit = max(0, total_rows - rows)
+            self.detail_scroll = min(self.detail_scroll, self.scroll_limit)
+            self.visible_processes = rows
+            first = self.detail_scroll * columns
+        elif total_rows > rows:
+            rows -= 1
+            self.put(y + height - 2, 2, "2  View all logical CPUs", 1, width - 4)
+        for index, percent in enumerate(m.cores[first:first + rows * columns]):
+            row = y + 3 + graph_height + index // columns
+            x = 2 + index % columns * per_row
+            cpu = m.cpu_ids[first + index]
+            self.put(row, x, f"{cpu:02} {percent:3.0f}%", 3, 8)
+            meter = per_row - (16 if thermal else 10)
+            self.bar(row, x + 8, meter, percent, self.RED if percent >= 80 else 0)
+            if thermal:
+                self.core_temperature(row, x + per_row - 6, cpu)
+
+    def memory_panel(self, y, x, width):
+        m = self.monitor
+        self.box(y, x, 6, width, "MEMORY", self.VIOLET, "....")
+        self.put(y + 1, x + 2, f"RAM   {size(m.mem.total - m.mem.available)} / {size(m.mem.total)}", 3, width - 4)
+        self.bar(y + 2, x + 2, width - 4, m.mem.percent, 1)
+        text = f"{size(m.swap.used)} / {size(m.swap.total)}" if m.swap.total else "disabled"
+        self.put(y + 3, x + 2, f"SWAP  {text}", 3, width - 4)
+        self.bar(y + 4, x + 2, width - 4, m.swap.percent, 1)
+
+    def gpu_panel(self, y, x, width):
+        m = self.monitor
+        self.box(y, x, 6, width, "GPU", self.VIOLET, "----")
+        if not m.gpus:
+            self.put(y + 2, x + 2, m.gpu_message, 2, width - 4)
+            return
+        name, load, temp, used, total, power, fan = m.gpus[0]
+        self.put(y + 1, x + 2, name.replace("NVIDIA ", ""), 3, width - 4)
+        usage = f"{metric(load, '%')}  {metric(temp, '°C')}  {metric(power, ' W')}"
+        self.put(y + 2, x + 2, usage, 4, width - 4)
+        self.bar(y + 3, x + 2, width - 4, usable_number(load), 4)
+        self.put(y + 4, x + 2, f"VRAM  {used} / {total} MiB", 3, width - 4)
+
+    def io_panel(self, y, x, width):
+        m = self.monitor
+        self.box(y, x, 6, width, "I/O", self.BLUE, "~~~~")
+        for index, (label, key) in enumerate((("NET ↓", "rx"), ("NET ↑", "tx"), ("READ ", "read"), ("WRITE", "write"))):
+            message = rate(m.graphs[key][-1]) if m.graphs[key] else "—"
+            if key in ("rx", "tx") and not m.links:
+                message = "—"
+            if key in ("read", "write") and not m.drives:
+                message = "—"
+            self.put(y + 1 + index, x + 2, f"{label}....{message}", self.BLUE if index < 2 else 5, width - 4)
+
+    def process_rows(self):
+        query = self.filter.casefold()
+        rows = [p for p in self.monitor.procs if query in p.name.casefold() or query in str(p.pid)]
+        field = self.SORT_FIELDS[self.sort]
+        rows.sort(key=lambda p: (p[field].casefold() if field == 1 else p[field], p.pid), reverse=self.reverse)
+        if not self.tree or query:
+            return [(proc, "") for proc in rows]
+        children = defaultdict(list)
+        pids = {proc.pid for proc in rows}
+        for proc in rows:
+            children[proc.parent if proc.parent in pids and proc.parent != proc.pid else 0].append(proc)
+        tree = []
+        stack = [(root, "", "", "") for root in reversed(children[0])]
+        while stack:
+            proc, prefix, branch, continuation = stack.pop()
+            tree.append((proc, prefix + branch))
+            kids = children[proc.pid]
+            for index in range(len(kids) - 1, -1, -1):
+                last = index == len(kids) - 1
+                stack.append((kids[index], prefix + continuation, "└─" if last else "├─", "  " if last else "│ "))
+        return tree
+
+    def process_panel(self, y, width, height):
+        rows = self.process_rows()
+        mode = "TREE" if self.tree and not self.filter else "LIST"
+        arrow = "↓" if self.reverse else "↑"
+        title = f"PROCESSES // {mode} // {self.SORT_LABELS[self.sort]} {arrow}"
+        self.box(y, 0, height, width, title, self.RED, "----....", rail_color=self.DARK_RED)
+        has_map = height >= 14
+        if has_map:
+            self.process_heatmap(y + 1, width, rows)
+        header = y + 1 + has_map
+        expanded = width >= 81
+        trace_width = min(14, 9 + max(0, width - 65) // 8)
+        fields = [("PID", 7, True), ("COMMAND", 0, False), ("CPU TRACE", trace_width, False),
+                  ("CPU %", 7, True), ("RAM", 9, True), ("S", 1, False)]
+        if expanded:
+            fields[2:2] = [("THR", 4, True), ("USER", 8, False)]
+        command_width = width - 4 - (len(fields) - 1) - sum(field[1] for field in fields)
+        fields[1] = ("COMMAND", command_width, False)
+        column_colors = {
+            "PID": self.RED, "THR": self.ORANGE, "USER": self.ORANGE,
+            "CPU TRACE": self.RED, "CPU %": self.NEON_GREEN, "RAM": 1, "S": 1,
+        }
+        haloes = {"PID": self.DARK_RED, "USER": self.AMBER_HALO, "CPU %": 9, "RAM": self.AQUA_HALO}
+        x = 2
+        positions = {}
+        glow_columns = []
+        for label, cells, align_right in fields:
+            positions[label] = x
+            align = ">" if align_right else "<"
+            self.put(header, x, f"{label:{align}{cells}.{cells}}",
+                     column_colors.get(label, self.PROCESS_GREY), cells)
+            if label in haloes:
+                glow_columns.append((x + cells, haloes[label]))
+                self.put(header, x + cells, "▏", haloes[label])
+            x += cells + 1
+        has_footer = height >= 9
+        self.visible_processes = max(1, height - 3 - has_footer - has_map)
+        self.scroll_limit = max(0, len(rows) - self.visible_processes)
+        self.offset = min(self.offset, self.scroll_limit)
+        for line, (proc, branch) in enumerate(rows[self.offset:self.offset + self.visible_processes]):
+            row = header + line + 1
+            branch = branch[-max(2, command_width // 2):]
+            command_x = positions["COMMAND"]
+            hot = proc.cpu >= 80
+            if hot or proc.state == "running":
+                self.put(row, 1, "▐" if hot else "▎", self.RED if hot else self.PROCESS_GREY)
+            for col, shadow in glow_columns:
+                self.put(row, col, "┊", shadow)
+            self.put(row, positions["PID"], f"{proc.pid:>7}", self.RED, 7)
+            self.put(row, command_x + len(branch), proc.name,
+                     self.RED if hot else self.PROCESS_GREY, command_width - len(branch))
+            if branch:
+                self.put(row, command_x, branch, self.PROCESS_DIM, len(branch))
+            if expanded:
+                self.put(row, positions["THR"], f"{proc.threads or '—':>4}", self.ORANGE, 4)
+                self.put(row, positions["USER"], proc.user, self.ORANGE, 8)
+            self.process_trace(row, positions["CPU TRACE"], trace_width, self.monitor.proc_traces[proc.pid])
+            self.put(row, positions["CPU %"], f"{proc.cpu:>7.1f}", self.NEON_GREEN, 7)
+            self.put(row, positions["RAM"], f"{size(proc.rss):>9}", 1, 9)
+            self.put(row, positions["S"], proc.state[:1].upper(), 1, 1)
+        if not rows:
+            self.put(header + 1, 2, "No matching processes", self.PROCESS_GREY, width - 4)
+        if self.scroll_limit and self.visible_processes >= 5:
+            track = self.visible_processes
+            thumb = max(1, round(track * self.visible_processes / len(rows)))
+            start = round((track - thumb) * self.offset / self.scroll_limit)
+            for pos in range(track):
+                active = start <= pos < start + thumb
+                self.put(header + 1 + pos, width - 1, "▌" if active else "┆",
+                         self.PROCESS_GREY if active else self.DARK_RED)
+        if has_footer:
+            rail = y + height - 2
+            self.put(rail, 2, ("----...." * width)[:width - 4], self.DARK_RED)
+            first = self.offset + 1 if rows else 0
+            last = min(len(rows), self.offset + self.visible_processes)
+            self.put(rail, 4, f" {first}–{last} / {len(rows)} ", self.PROCESS_GREY)
+            hot_count = sum(proc.cpu >= 80 for proc, _ in rows)
+            activity = f" {hot_count} ≥80% CPU "
+            self.put(rail, width - len(activity) - 4, activity, self.RED if hot_count else self.PROCESS_DIM)
+
+    def process_heatmap(self, row, width, rows):
+        left = " ◈ LOAD MAP "
+        active = sum(proc.cpu > 0 for proc, _ in rows)
+        right = f" {active} ACTIVE "
+        space = width - 4 - len(left) - len(right) - 2
+        count = min(16, space // 2)
+        busiest = nlargest(count, (proc for proc, _ in rows), key=lambda proc: proc.cpu)
+        self.put(row, 2, left, self.RED)
+        x = 2 + len(left)
+        self.put(row, x, "║", self.DARK_RED)
+        fills = "·░▒▓█"
+        for index in range(count):
+            load = busiest[index].cpu if index < len(busiest) else 0
+            level = min(4, math.ceil(load / 25))
+            color = self.RED if load >= 80 else self.DARK_RED if load >= 40 else self.PROCESS_DIM
+            self.put(row, x + 1 + index * 2, fills[level] * 2, color)
+        gap = space - count * 2
+        self.put(row, x + 1 + count * 2, "." * gap, self.DARK_RED)
+        self.put(row, width - 3 - len(right), "║", self.DARK_RED)
+        self.put(row, width - 2 - len(right), right, self.PROCESS_GREY)
+
+    def process_trace(self, row, x, width, history):
+        values = list(history)[-2 * width:]
+        values = [0.0] * (2 * width - len(values)) + values
+        for col, (left, right) in enumerate(zip(values[::2], values[1::2])):
+            first = self.DOTS[0][min(4, math.ceil(left / 25))]
+            second = self.DOTS[1][min(4, math.ceil(right / 25))]
+            peak = max(left, right)
+            color = 1 if peak else self.DARK_RED
+            self.put(row, x + col, chr(0x2800 + (first | second)) if peak else ".", color)
+
+    def detail(self, height, width):
+        m = self.monitor
+        if self.page == 1:
+            self.put(3, 2, m.model, 1)
+            self.put(4, 2, f"{m.physical or '?'} physical cores  /  {len(m.cores)} logical CPUs  /  {m.allowed} available to Signal")
+            if m.core_temps:
+                self.put(5, 2, "Temperature is shared by threads on the same physical core.", 2)
+            self.cpu_panel(6, width, height - 7)
+            return
+        if self.page == 5:
+            self.process_panel(3, width, height - 4)
+            return
+        lines = []
+        if self.page == 2:
+            title, color = "NVIDIA GPU", 4
+            for name, load, temp, used, total, power, fan in m.gpus:
+                lines.extend([name, f"Load {metric(load, '%')}    Temp {metric(temp, '°C')}    "
+                              f"Power {metric(power, ' W')}    Fan {metric(fan, '%')}",
+                              f"VRAM {used} / {total} MiB", ""])
+            if not lines:
+                lines.append(m.gpu_message)
+            graph_keys = (("gpu", "GPU load"),) if m.gpus else ()
+        elif self.page == 3:
+            title, color = "STORAGE", 5
+            lines.extend(f"{usage.percent:5.1f}%  {size(usage.used):>10} / {size(usage.total):<10}  {path}"
+                         for path, usage in m.mounts)
+            if not lines:
+                lines.append("No filesystem statistics")
+            lines.append("")
+            lines.extend(f"{name:<16} read {rate(read):>13}   write {rate(write):>13}"
+                         for name, read, write in m.drives)
+            graph_keys = (("read", "Read"), ("write", "Write")) if m.drives else ()
+        else:
+            title, color = "NETWORK", 1
+            lines = [f"{name:<16} down {rate(rx):>13}     up {rate(tx):>13}" for name, rx, tx in m.links]
+            if not lines:
+                lines.append("No non-loopback interfaces visible")
+            graph_keys = (("rx", "Receive"), ("tx", "Transmit")) if m.links else ()
+        trim = "~~~~" if self.page == 4 else "----...."
+        self.box(3, 0, height - 4, width, title, self.BLUE if self.page == 4 else color, trim)
+        graph_space = 5 * len(graph_keys) if height >= 22 else 0
+        line_count = height - 6 - graph_space
+        self.visible_processes = line_count
+        self.scroll_limit = max(0, len(lines) - line_count)
+        self.detail_scroll = min(self.detail_scroll, self.scroll_limit)
+        for index, line in enumerate(lines[self.detail_scroll:self.detail_scroll + line_count]):
+            self.put(4 + index, 2, line, 3, width - 4)
+        if graph_space:
+            for index, (key, label) in enumerate(graph_keys):
+                y = height - 2 - graph_space + index * 5
+                history = m.graphs[key]
+                upper = 100 if key == "gpu" else max(1, max(history, default=0))
+                peak = "100%" if key == "gpu" else rate(upper)
+                self.put(y, 2, f"{label}  /  scale {peak}", color)
+                self.graph(y + 1, 2, 3, width - 4, key, upper, color)
+
+    def draw(self):
+        self.win.erase()
+        self.binary_regions.clear()
+        self.glyph_region = None
+        height, actual_width = self.win.getmaxyx()
+        width = actual_width - 1
+        if height < 20 or width < 61:
+            self.put(0, 0, "SIGNAL  /  resize to at least 62 columns × 20 rows")
+            self.win.refresh()
+            return
+        m = self.monitor
+        self.put(0, 0, "░▒▓", 6)
+        self.put(0, 3, "█  S I G N A L  █", 0)
+        self.put(0, 20, "▓▒░", 6)
+        host = f"{m.host}  /  UP {age(time.time() - m.boot)}  /  {time.strftime('%H:%M:%S')}"
+        host_x = max(24, width - len(host) - 1)
+        glyph_start = 25
+        if host_x >= 49:
+            self.put(0, 25, "⟪ OPERATIONS CONSOLE ⟫", 1)
+            glyph_start = 49
+        self.put(0, host_x, host, 2)
+        glyph_space = host_x - glyph_start
+        count = (glyph_space - 3) // 2
+        if count >= 2:
+            self.glyph_region = (glyph_start + 1, count)
+        x = 1
+        for index, name in enumerate(self.KEYS):
+            label = f"{index + 1} {name}"
+            self.put(1, x, label, 0 if index == self.page else 2)
+            x += len(label) + (2 if width >= 76 else 1)
+        if width - x >= 6:
+            self.binary_regions.append((1, x, 1, width - x - 1))
+        self.put(2, 0, ("-----....." * width)[:width], 2)
+        label = " LOCAL TELEMETRY "
+        self.put(2, 2, label, 6)
+        tick = int(time.monotonic() / m.interval)
+        sweep_start = 3 + len(label)
+        sweep_width = width - 15 - sweep_start
+        sweep = sweep_start + tick % sweep_width
+        for col, glyph, color in ((sweep - 2, "░", self.DARK_BLUE), (sweep - 1, "▒", self.BLUE), (sweep, "▌", 1)):
+            if col >= sweep_start:
+                self.put(2, col, glyph, color)
+        pulse = ("·..", ".·.", "..·")[tick % 3]
+        self.put(2, width - 12, f" {pulse} LIVE ", 0)
+        if self.help:
+            self.box(3, 0, height - 4, width, "KEYS", 1)
+            entries = ("1–6  Switch views         Tab  Next view",
+                       "↑/↓  Scroll               PgUp/PgDn  Scroll by page",
+                       "s    Sort processes      r    Reverse sort",
+                       "t    Tree/list view",
+                       "b    Toggle animated binary",
+                       "/    Filter by PID/name  Esc  Clear filter",
+                       "?    Toggle this help    q    Quit",
+                       "Process CPU: 100% equals one logical CPU.",
+                       "Red CPU meters indicate 80% or higher.")
+            for index, entry in enumerate(entries):
+                self.put(5 + index, 2, entry, 3, width - 4)
+        elif self.page == 0 and width >= 111 and height >= 28:
+            self.wide_overview(height, width)
+        elif self.page == 0:
+            cpu_height = min(15, height - 14)
+            self.cpu_panel(3, width, cpu_height)
+            y = 3 + cpu_height
+            third = width // 3
+            if width >= 82:
+                self.memory_panel(y, 0, third)
+                self.gpu_panel(y, third, third)
+                self.io_panel(y, third * 2, width - third * 2)
+            else:
+                half = width // 2
+                self.memory_panel(y, 0, half)
+                self.gpu_panel(y, half, width - half)
+            self.process_panel(y + 6, width, height - y - 7)
+        else:
+            self.detail(height, width)
+        footer = "q Quit   ? Keys   / Filter   s Sort   t Tree   ↑↓ Scroll"
+        if self.editing or self.filter:
+            footer = ("FILTER › " if self.editing else "FILTER / ") + self.filter
+        self.put(height - 1, 1, footer, 1)
+        status = f"{len(m.procs)} PROC  //  {m.interval:g}s SAMPLE"
+        status_x = width - len(status) - 1
+        if status_x - len(footer) >= 3:
+            self.put(height - 1, status_x, status, 2)
+            gap = status_x - len(footer) - 4
+            if gap >= 8:
+                self.binary_regions.append((height - 1, len(footer) + 3, 1, gap))
+        self.animate(time.monotonic(), force=True)
+
+    def animate(self, now, force=False):
+        self.animate_binary(now)
+        if self.glyph_region:
+            frame = int((now - self.binary_epoch) * self.GLYPH_FPS)
+            if force or frame != self.glyph_frame:
+                self.animate_glyphs(frame)
+                self.glyph_frame = frame
+        self.win.refresh()
+
+    def animate_glyphs(self, frame):
+        x, count = self.glyph_region
+        self.put(0, x, "⟦", self.DARK_RED)
+        self.put(0, x + count * 2 + 1, "⟧", self.DARK_RED)
+        sweep = frame % count
+        tones = (self.DARK_RED, self.DARK_BLUE, self.VIOLET, self.DARK_BLUE, 5)
+        pulse = (1, self.PROCESS_GREY, self.HISTORY_RED, self.DARK_RED)
+        for index in range(count):
+            glyph = self.header_glyphs[index % len(self.header_glyphs)]
+            distance = (sweep - index) % count
+            if distance < len(pulse):
+                color = pulse[distance]
+                if distance < 2:
+                    glyph = self.GLYPH_BANK[(frame + index * 3) % len(self.GLYPH_BANK)]
+            else:
+                color = tones[index % len(tones)]
+            self.put(0, x + 2 + index * 2, glyph, color)
+
+    def make_binary_streams(self, lanes, span, vertical):
+        rng = self.binary_random
+        streams = []
+        for lane in range(lanes):
+            for _ in range(max(1, span // 15)):
+                length = rng.randint(3, min(10, max(3, span // 2)))
+                streams.append(BinaryStream(
+                    lane, rng.randrange(span + length), rng.uniform(2.0, 10.0),
+                    not vertical and rng.choice((False, True)),
+                    "".join(rng.choices("01", k=length)),
+                    rng.randrange(length) if rng.random() < .8 else -1,
+                ))
+        return streams
+
+    def animate_binary(self, now):
+        if self.binary:
+            elapsed = now - self.binary_epoch
+            self.binary_streams = {region: self.binary_streams[region] for region in self.binary_regions
+                                   if region in self.binary_streams}
+            for region in self.binary_regions:
+                y, x, height, width = region
+                vertical = height > width
+                lanes, span = (width, height) if vertical else (height, width)
+                if region not in self.binary_streams:
+                    self.binary_streams[region] = self.make_binary_streams(lanes, span, vertical)
+                digits = [[" "] * width for _ in range(height)]
+                accents = {}
+                for stream in self.binary_streams[region]:
+                    steps = stream.offset + elapsed * stream.speed
+                    cycles, position = divmod(steps, span + len(stream.digits))
+                    cycle, head = int(cycles), int(position)
+                    fraction = position - head
+                    for index, bit in enumerate(stream.digits):
+                        pos = head - index
+                        if not 0 <= pos < span:
+                            continue
+                        if stream.reverse:
+                            pos = span - pos - 1
+                        row, col = (pos, stream.lane) if vertical else (stream.lane, pos)
+                        digits[row][col] = bit if cycle % 2 == 0 else ("1" if bit == "0" else "0")
+                        if stream.glint >= 0 and index == (stream.glint + cycle) % len(stream.digits):
+                            accents[row, col] = self.BINARY_WHITE
+                        elif index == len(stream.digits) - 1 and fraction > .3:
+                            accents[row, col] = self.BINARY_SHADOW if fraction > .65 else self.BINARY_MID
+                        else:
+                            accents.pop((row, col), None)
+                    if fraction > .3 and head + 1 < span:
+                        pos = span - head - 2 if stream.reverse else head + 1
+                        row, col = (pos, stream.lane) if vertical else (stream.lane, pos)
+                        if digits[row][col] == " ":
+                            bit = stream.digits[0]
+                            digits[row][col] = bit if cycle % 2 == 0 else ("1" if bit == "0" else "0")
+                            accents[row, col] = self.BINARY_MID if fraction > .65 else self.BINARY_SHADOW
+                for row in range(height):
+                    self.put(y + row, x, "".join(digits[row]), self.BINARY_RED, width)
+                for (row, col), color in accents.items():
+                    self.put(y + row, x + col, digits[row][col], color, 1)
+
+    def handle(self, key):
+        if key == "\x03":
+            return False
+        if self.editing:
+            if key in ("\n", "\r", curses.KEY_ENTER, "\x1b"):
+                self.editing = False
+            elif key in ("\b", "\x7f", curses.KEY_BACKSPACE):
+                self.filter = self.filter[:-1]
+            elif isinstance(key, str) and key.isprintable() and len(self.filter) < 80:
+                self.filter += key
+            self.offset = 0
+            return True
+        if key in ("q", "Q"):
+            return False
+        if key == "?":
+            self.help = not self.help
+        elif key == "\x1b":
+            self.help = False
+            self.filter = ""
+            self.offset = 0
+        elif isinstance(key, str) and key in "123456\t":
+            self.page = (self.page + 1) % 6 if key == "\t" else int(key) - 1
+            self.detail_scroll = 0
+            self.help = False
+        elif key == "/":
+            self.page = 5
+            self.help = False
+            self.editing = True
+        elif key == "s":
+            self.sort = (self.sort + 1) % len(self.SORT_FIELDS)
+            self.reverse = self.sort < 2
+            self.offset = 0
+            if self.page not in (0, 5):
+                self.page = 5
+        elif key == "r":
+            self.reverse = not self.reverse
+            self.offset = 0
+        elif key == "t":
+            self.tree = not self.tree
+            self.offset = 0
+            if self.page not in (0, 5):
+                self.page = 5
+        elif key == "b":
+            self.binary = not self.binary
+        elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
+            step = 1 if key in (curses.KEY_UP, curses.KEY_DOWN) else self.visible_processes
+            if key in (curses.KEY_UP, curses.KEY_PPAGE):
+                step = -step
+            attr = "offset" if self.page in (0, 5) else "detail_scroll"
+            setattr(self, attr, max(0, min(self.scroll_limit, getattr(self, attr) + step)))
+        return True
+
+
+def run(window, monitor):
+    screen = Screen(window, monitor)
+    next_sample = 0.0
+    next_animation = 0.0
+    dirty = True
+    while True:
+        now = time.monotonic()
+        monitor.poll_gpu(now)
+        if now >= next_sample:
+            monitor.sample()
+            next_sample = now + monitor.interval
+            dirty = True
+        now = time.monotonic()
+        redrawn = dirty
+        if dirty:
+            screen.draw()
+            dirty = False
+        animation_hz = Screen.GLYPH_FPS if screen.glyph_region else 0
+        if screen.binary and screen.binary_regions:
+            animation_hz = 60
+        if animation_hz and (redrawn or now >= next_animation):
+            if not redrawn:
+                screen.animate(now)
+            next_animation = (math.floor(now * animation_hz) + 1) / animation_hz
+        deadline = min(next_sample, next_animation) if animation_hz else next_sample
+        wait_ms = math.ceil((deadline - time.monotonic()) * 1000)
+        window.timeout(max(1, min(125, wait_ms)))
+        try:
+            key = window.get_wch()
+        except curses.error:
+            continue
+        if not screen.handle(key):
+            return
+        dirty = True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--interval", type=float, default=1.0,
+                        help="sample interval in seconds (0.5 to 30, default 1)")
+    args = parser.parse_args()
+    if not 0.5 <= args.interval <= 30:
+        parser.error("--interval must be between 0.5 and 30 seconds")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        parser.error("an interactive terminal is required")
+    original_term = os.environ.get("TERM")
+    if original_term == "xterm-kitty" and curses.has_extended_color_support():
+        # Use Kitty's direct RGB support without rewriting its indexed palette.
+        try:
+            curses.setupterm("xterm-direct")
+        except curses.error:
+            pass
+        else:
+            os.environ["TERM"] = "xterm-direct"
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            curses.wrapper(run, Monitor(executor, args.interval))
+    except KeyboardInterrupt:
+        return
+    finally:
+        if original_term == "xterm-kitty":
+            os.environ["TERM"] = original_term
+
+
+if __name__ == "__main__":
+    main()
