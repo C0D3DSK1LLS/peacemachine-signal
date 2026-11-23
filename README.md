@@ -40,3 +40,5 @@ Use a terminal at least 112 columns by 28 rows for the wide layout. The compact 
 | t | Toggle the process tree |
 | b | Toggle the animated binary |
 | ? / q | Show shortcuts or quit |
+
+Thank you for supporting my work!
