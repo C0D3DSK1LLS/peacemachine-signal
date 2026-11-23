@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+launcher=$(readlink -f -- "$0")
+project_dir=${launcher%/*}
+if [ -x "$project_dir/.venv/bin/python" ]; then
+    exec "$project_dir/.venv/bin/python" "$project_dir/signal-monitor" "$@"
+fi
+exec python3 "$project_dir/signal-monitor" "$@"

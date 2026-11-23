@@ -27,10 +27,30 @@ Install the dependency.
 Start the dashboard.
 
 ```bash
-.venv/bin/python signal-monitor
+./pmsig
 ```
 
 Use a terminal at least 112 columns by 28 rows for the wide layout. The compact layout fits 62 by 20.
+
+### Run from any directory
+
+From the repository directory, add the launcher to your user bin directory.
+
+```bash
+mkdir -p ~/.local/bin
+```
+
+```bash
+ln -s "$PWD/pmsig" ~/.local/bin/pmsig
+```
+
+With `~/.local/bin` on your `PATH`, launch it with the one-word command.
+
+```bash
+pmsig
+```
+
+### Keys
 
 | Key | Action |
 | --- | --- |
