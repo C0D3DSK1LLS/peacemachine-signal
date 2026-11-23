@@ -24,7 +24,17 @@ Install the dependency.
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Add the launcher to your user bin directory.
+Start the dashboard.
+
+```bash
+./pmsig
+```
+
+Use a terminal at least 112 columns by 28 rows for the wide layout. The compact layout fits 62 by 20.
+
+### Run from any directory
+
+From the repository directory, add the launcher to your user bin directory.
 
 ```bash
 mkdir -p ~/.local/bin
@@ -34,13 +44,11 @@ mkdir -p ~/.local/bin
 ln -s "$PWD/pmsig" ~/.local/bin/pmsig
 ```
 
-With `~/.local/bin` on your `PATH`, start the dashboard.
+With `~/.local/bin` on your `PATH`, launch it with the one-word command.
 
 ```bash
 pmsig
 ```
-
-Use a terminal at least 112 columns by 28 rows for the wide layout. The compact layout fits 62 by 20.
 
 ### Keys
 
